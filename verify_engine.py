@@ -13,10 +13,12 @@ import re
 
 from sympy import E as _E
 from sympy import (
+    Add,
     Eq,
     FiniteSet,
     Mul,
     Poly,
+    Pow,
     S,
     Symbol,
     cancel,
@@ -64,13 +66,34 @@ def safe_parse(text):
     return parse_expr(text, transformations=TRANSFORMATIONS, global_dict=dict(SAFE_GLOBALS), evaluate=True)
 
 
-def split_equation(text):
+# Con evaluate=False il parser di SymPy genera codice che costruisce l'albero
+# a mano, quindi ha bisogno dei costruttori (Mul/Add/Pow) nel namespace:
+# senza, solleva NameError e il parsing grezzo non funziona MAI. Sono
+# costruttori di espressioni, stessa categoria di Integer/Float/Symbol gia'
+# presenti: non allargano la superficie di rischio.
+RAW_GLOBALS = dict(SAFE_GLOBALS, Mul=Mul, Add=Add, Pow=Pow)
+
+
+def safe_parse_raw(text):
+    """Come safe_parse ma SENZA valutare: conserva la struttura esattamente
+    come l'ha scritta lo studente. Serve per le diagnosi strutturali (es.
+    riconoscere un raccoglimento) che la valutazione distruggerebbe: SymPy
+    normalmente collassa 'x^2*(2-3)' in '-x^2', cancellando ogni traccia del
+    fatto che lo studente aveva raccolto x^2. Da NON usare per i confronti
+    matematici (un albero non valutato non e' affidabile per quelli)."""
+    return parse_expr(text.strip(), transformations=TRANSFORMATIONS,
+                      global_dict=dict(RAW_GLOBALS), evaluate=False)
+
+
+def split_equation(text, raw=False):
     """'lhs = rhs' (textual) -> (lhs_expr, rhs_expr). Raises ValueError with a
-    human-readable reason on anything that isn't exactly one '='."""
+    human-readable reason on anything that isn't exactly one '='. Con
+    raw=True usa safe_parse_raw (struttura conservata, vedi sopra)."""
     if text.count('=') != 1:
         raise ValueError(f"attesa esattamente una '=', trovate {text.count('=')}")
     left_txt, right_txt = text.split('=')
-    return safe_parse(left_txt), safe_parse(right_txt)
+    parser = safe_parse_raw if raw else safe_parse
+    return parser(left_txt), parser(right_txt)
 
 
 def detect_variable(*exprs, hint=None):
@@ -209,6 +232,18 @@ def check_fraction_relation(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     if not row_has_fraction(prev_lhs, prev_rhs, var):
         return {'supported': False}
 
+    # Prima di tutto: la frazione e' rimasta identica e sono cambiati solo i
+    # termini polinomiali? (es. "porto tutto a primo membro"). E' il caso
+    # piu' semplice e va riconosciuto per primo, altrimenti finisce nel ramo
+    # "combina frazioni" o nel fallback, con spiegazioni che non c'entrano.
+    transport = check_fraction_transport(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
+    if transport is not None:
+        return transport
+
+    partial = check_partial_denominator_clearing(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
+    if partial is not None:
+        return partial
+
     if row_has_fraction(cur_lhs, cur_rhs, var):
         # La riga corrente ha ancora una frazione: non è un tentativo di
         # eliminare il denominatore (quello produce un polinomio pulito),
@@ -313,7 +348,8 @@ def _pulled_factor(expr, var):
     return F, monoms[0][0]
 
 
-def _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
+def _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var,
+                          raw_cur_lhs=None, raw_cur_rhs=None):
     """Riconosce un raccoglimento impossibile: lo studente ha raccolto un
     fattore var**k su un lato (es. x^2) ma quel lato, nel passaggio
     precedente, aveva un termine di grado inferiore a k (es. 3x) — quel
@@ -321,12 +357,22 @@ def _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     non è valido a prescindere da cosa scrive dentro la parentesi. None se il
     pattern non si applica (nessun raccoglimento esplicito individuato, o il
     grado raccolto è comunque valido — allora l'errore è altrove, tipicamente
-    un pezzo dimenticato dentro la parentesi)."""
-    for prev_side, cur_side, label in ((prev_lhs, cur_lhs, "a sinistra"), (prev_rhs, cur_rhs, "a destra")):
+    un pezzo dimenticato dentro la parentesi).
+
+    raw_cur_lhs/raw_cur_rhs sono le stesse righe parsate SENZA valutazione:
+    quando ci sono si cerca il raccoglimento li' dentro, perche' la versione
+    valutata puo' aver gia' cancellato la parentesi (es. 'x^2*(2-3)' diventa
+    '-x^2': senza la forma grezza il raccoglimento sarebbe invisibile e lo
+    studente si vedrebbe un messaggio generico su tutt'altro)."""
+    sides = (
+        (prev_lhs, cur_lhs, raw_cur_lhs if raw_cur_lhs is not None else cur_lhs, "a sinistra"),
+        (prev_rhs, cur_rhs, raw_cur_rhs if raw_cur_rhs is not None else cur_rhs, "a destra"),
+    )
+    for prev_side, _cur_side, search_side, label in sides:
         # Il raccoglimento potrebbe non coprire l'intero lato (es. resta un
         # termine noto fuori dalla parentesi: "x^2*(x+3) - 4"): va cercato in
         # ciascun addendo, non solo nel lato preso per intero.
-        terms = cur_side.args if cur_side.is_Add else (cur_side,)
+        terms = search_side.args if search_side.is_Add else (search_side,)
         for term in terms:
             pulled = _pulled_factor(term, var)
             if pulled is None:
@@ -344,32 +390,54 @@ def _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
                 term_str = term_str[1:]
             factor_str = format_expr_raw(F)
             return (f"Non puoi raccogliere {factor_str} {label}: il termine {term_str} "
-                    f"non è un multiplo di {factor_str}.")
+                    f"non è un multiplo di {factor_str}. Per raccogliere {factor_str} "
+                    f"ogni termine deve contenerlo.")
     return None
 
 
-def _distribution_mismatch_diagnosis(prev_side, cur_side, var, label):
-    """Riconosce una distribuzione incompleta: prev_side ha la forma F*(...)
-    esplicita e cur_side sembra un tentativo di distribuirla ma non
-    corrisponde all'espansione corretta — nomina esattamente il termine
-    dentro la parentesi che non è stato moltiplicato. None se prev_side non
-    aveva questa forma (allora la causa dell'errore è un'altra e non va
-    inventata qui). Si applica solo quando F contiene la variabile (es.
-    x*(x+3)): se F è un numero puro (es. 2*(x-3)), SymPy lo distribuisce già
-    automaticamente in fase di parsing (e' una sua canonicalizzazione, non
-    controllabile da qui) — a quel punto prev_side arriva già espanso e
-    questa funzione non trova nulla da segnalare, il che va bene: il
-    fallback generico del chiamante resta comunque corretto e non
-    fuorviante per quel caso."""
-    factors = Mul.make_args(prev_side)
+def _factor_and_paren(expr):
+    """Da un'espressione della forma F*(...) ritorna (F, parentesi) con
+    ENTRAMBI i pezzi valutati, oppure None. Valutare i pezzi e' obbligatorio
+    se expr viene da safe_parse_raw: la forma grezza di '2*(x-3)' e'
+    '2*(x - 1*3)' e stamparla cosi' com'e' produrrebbe '2(x - 13)' (il
+    formattatore toglie gli asterischi), cioe' un messaggio palesemente
+    sbagliato sotto gli occhi dello studente."""
+    factors = Mul.make_args(expr)
     add_factors = [f for f in factors if f.is_Add]
     if len(add_factors) != 1:
         return None
+    paren = add_factors[0].doit(deep=True)
     rest = [f for f in factors if f is not add_factors[0]]
-    F = Mul(*rest) if rest else S(1)
-    if F == 1:
+    F = (Mul(*rest) if rest else S(1)).doit(deep=True)
+    if F == 1 or not paren.is_Add:
         return None
-    expected = expand(prev_side)
+    return F, paren
+
+
+def _distribution_mismatch_diagnosis(prev_side, cur_side, var, label, raw_prev_side=None):
+    """Riconosce una distribuzione incompleta: la riga precedente aveva la
+    forma F*(...) e la riga corrente sembra un tentativo di distribuirla che
+    non corrisponde all'espansione corretta — nomina il termine dentro la
+    parentesi che non è stato moltiplicato. None se quella forma non c'è
+    (allora la causa dell'errore è un'altra e non va inventata qui).
+
+    raw_prev_side è la riga precedente parsata senza valutazione, ed è
+    quella che conta davvero: SymPy espande da solo i fattori numerici in
+    fase di parsing ('2*(x-3)' diventa subito '2x - 6'), quindi senza la
+    forma grezza il caso più comune di tutti — dimenticare di moltiplicare
+    il numero per il secondo termine della parentesi — sarebbe invisibile, e
+    lo studente si vedrebbe citare un '2x - 6' che non ha mai scritto."""
+    source = raw_prev_side if raw_prev_side is not None else prev_side
+    parts = _factor_and_paren(source)
+    if parts is None:
+        return None
+    F, paren = parts
+    expected = expand(F * paren)
+    # Coerenza fra forma grezza e forma valutata: se non combaciano, la
+    # struttura letta non è davvero quella della riga precedente e qualsiasi
+    # spiegazione costruita sopra sarebbe inventata.
+    if simplify(cancel(expected - expand(prev_side))) != 0:
+        return None
     if simplify(cancel(cur_side - expected)) == 0:
         return None
     expected_coeffs = poly_coeffs(expected, var)
@@ -380,9 +448,11 @@ def _distribution_mismatch_diagnosis(prev_side, cur_side, var, label):
     if not diffs:
         return None
     d = max(diffs)
-    return (f"Hai distribuito {format_expr_raw(F)} solo su una parte della parentesi {label}: "
-            f"{format_expr_raw(prev_side)} diventa correttamente {format_expr(expected)}, "
-            f"ma manca la moltiplicazione nel {term_label(d, var)}.")
+    f_str, paren_str = format_expr_raw(F), format_expr_raw(paren)
+    return (f"Nel membro {label} hai moltiplicato {f_str} solo per una parte della parentesi: "
+            f"{f_str}({paren_str}) fa {format_expr(expected)}, non {format_expr(cur_side)}. "
+            f"Controlla il {term_label(d, var)}: {f_str} va moltiplicato per OGNI termine "
+            f"dentro la parentesi.")
 
 
 def diagnose_multiply_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var, k):
@@ -408,16 +478,63 @@ def diagnose_multiply_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var, k):
                 mism.append((side_label, d, p[d], c[d]))
     if not mism or len(mism) > 2:
         return None
+    # k = -1 e' il caso "ho cambiato tutti i segni": chiamarlo
+    # "moltiplicando per -1" e' corretto ma non e' come lo pensa lo studente.
+    operazione = "cambiando tutti i segni" if k == -1 else f"moltiplicando per {fmt_num(k)}"
     parts = []
     for side_label, d, pval, cval in mism:
         expected_val = simplify(k * pval)
-        parts.append(f"nel {term_label(d, var)} a {side_label} moltiplicando per {fmt_num(k)} "
+        parts.append(f"nel {term_label(d, var)} a {side_label} {operazione} "
                       f"ci si aspetta {fmt_term(expected_val, d, var)}, tu hai scritto {fmt_term(cval, d, var)}")
     text = '; '.join(parts) + '.'
     return text[0].upper() + text[1:]
 
 
-def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
+def _rewrite_message(label, prev_side, cur_side):
+    """Ultimo messaggio disponibile quando si sa che UN membro è stato
+    riscritto male ma non quale operazione lo studente stesse tentando:
+    mostra il prima e il dopo e si ferma lì. Deliberatamente NON parla di
+    raccoglimento o distribuzione: quando l'operazione è riconosciuta ci
+    pensano le funzioni dedicate, e appiccicare qui un consiglio sul
+    'raccogliere' finiva per darlo anche a chi stava facendo tutt'altro."""
+    return (f"Hai riscritto il membro {label} in modo scorretto: prima era "
+            f"{format_expr(prev_side)}, ora è {format_expr(cur_side)} — non sono la stessa "
+            f"espressione. Ricontrolla i segni e i numeri di questo membro, uno per uno.")
+
+
+def _factoring_mismatch_diagnosis(prev_side, cur_side, var, label, raw_cur_side=None):
+    """Il caso speculare di _distribution_mismatch_diagnosis: la parentesi
+    sta nella riga NUOVA perché lo studente ha raccolto un fattore comune,
+    e il fattore raccolto è legittimo (divide davvero tutti i termini) ma
+    quello che ha lasciato dentro la parentesi è sbagliato.
+
+    Qui si può dire esattamente cosa doveva restarci dentro — che è
+    l'informazione utile — invece del generico 'non sono la stessa
+    espressione'. Se invece il fattore NON divide tutti i termini l'errore è
+    un altro (raccoglimento impossibile) e lo spiega _bad_factor_diagnosis."""
+    source = raw_cur_side if raw_cur_side is not None else cur_side
+    parts = _factor_and_paren(source)
+    if parts is None:
+        return None
+    F, paren = parts
+    if F == 0:
+        return None
+    atteso = cancel(prev_side / F)
+    if poly_coeffs(atteso, var) is None:
+        return None  # il fattore non divide in modo pulito: non e' questo il caso
+    if simplify(cancel(paren - atteso)) == 0:
+        return None  # la parentesi e' giusta: l'errore, se c'e', sta altrove
+    if simplify(cancel(expand(F * paren) - expand(cur_side))) != 0:
+        return None  # struttura letta non coerente con la riga scritta
+    f_str = format_expr_raw(F)
+    return (f"Raccogliendo {f_str} nel membro {label} hai sbagliato quello che resta dentro la "
+            f"parentesi: {format_expr_raw(prev_side)} diviso {f_str} fa {format_expr(atteso)}, "
+            f"quindi va scritto {f_str}({format_expr(atteso)}), non {f_str}({format_expr_raw(paren)}).")
+
+
+def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var,
+                  raw_prev_lhs=None, raw_prev_rhs=None,
+                  raw_cur_lhs=None, raw_cur_rhs=None):
     """Per-side (left vs right) coefficient comparison — same style as the
     JS diagnosis, but exact/symbolic instead of numeric-fitted."""
     pL = poly_coeffs(prev_lhs, var); pR = poly_coeffs(prev_rhs, var)
@@ -454,24 +571,44 @@ def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
         bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
         if bad_factor is not None:
             return bad_factor
-        dist_msg = _distribution_mismatch_diagnosis(prev_lhs, cur_lhs, var, "sinistro")
+        dist_msg = _distribution_mismatch_diagnosis(prev_lhs, cur_lhs, var, "sinistro", raw_prev_lhs)
         if dist_msg is not None:
             return dist_msg
-        prev_s, cur_s = format_expr(prev_lhs), format_expr(cur_lhs)
-        return (f"Hai riscritto il lato sinistro in modo scorretto: prima era {prev_s}, ora è {cur_s} — "
-                f"non sono la stessa espressione. Se hai provato a raccogliere un fattore comune, "
-                f"controlla che moltiplichi davvero TUTTI i termini dentro la parentesi, non solo alcuni.")
+        fact_msg = _factoring_mismatch_diagnosis(prev_lhs, cur_lhs, var, "sinistro", raw_cur_lhs)
+        if fact_msg is not None:
+            return fact_msg
+        return _rewrite_message("sinistro", prev_lhs, cur_lhs)
     if mism_all_on_right and (left_is_trivial or (left_unchanged_all and len(mism) == 1)):
         bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
         if bad_factor is not None:
             return bad_factor
-        dist_msg = _distribution_mismatch_diagnosis(prev_rhs, cur_rhs, var, "destro")
+        dist_msg = _distribution_mismatch_diagnosis(prev_rhs, cur_rhs, var, "destro", raw_prev_rhs)
         if dist_msg is not None:
             return dist_msg
-        prev_s, cur_s = format_expr(prev_rhs), format_expr(cur_rhs)
-        return (f"Hai riscritto il lato destro in modo scorretto: prima era {prev_s}, ora è {cur_s} — "
-                f"non sono la stessa espressione. Se hai provato a raccogliere un fattore comune, "
-                f"controlla che moltiplichi davvero TUTTI i termini dentro la parentesi, non solo alcuni.")
+        fact_msg = _factoring_mismatch_diagnosis(prev_rhs, cur_rhs, var, "destro", raw_cur_rhs)
+        if fact_msg is not None:
+            return fact_msg
+        return _rewrite_message("destro", prev_rhs, cur_rhs)
+
+    # Trasporto senza cambio di segno: il termine sparisce da un lato e
+    # ricompare dall'altro IDENTICO invece che col segno invertito. E' uno
+    # degli errori piu' comuni in assoluto e merita di essere chiamato col
+    # suo nome, invece di finire nel confronto generico termine-per-termine
+    # (che direbbe solo "i due lati devono cambiare allo stesso modo",
+    # lasciando allo studente il lavoro di capire che si trattava del segno).
+    for d in sorted(mism, reverse=True):
+        moved_from_right = (simplify(cR[d]) == 0 and simplify(pR[d]) != 0
+                            and simplify((cL[d] - pL[d]) - pR[d]) == 0)
+        moved_from_left = (simplify(cL[d]) == 0 and simplify(pL[d]) != 0
+                           and simplify((cR[d] - pR[d]) - pL[d]) == 0)
+        if moved_from_right or moved_from_left:
+            origin, dest = ("destra", "sinistra") if moved_from_right else ("sinistra", "destra")
+            moved_val = pR[d] if moved_from_right else pL[d]
+            written = fmt_term(moved_val, d, var)
+            expected = fmt_term(simplify(-moved_val), d, var)
+            return (f"Hai spostato il {term_label(d, var)} da {origin} a {dest} "
+                    f"senza cambiargli segno: passando dall'altra parte dell'uguale "
+                    f"{written} deve diventare {expected}.")
 
     parts = []
     for d in sorted(mism, reverse=True)[:2]:
@@ -506,6 +643,90 @@ def diagnose_fraction_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_l
     detail = diagnose_step(expected_lhs, expected_rhs, cur_lhs, cur_rhs, var)
     bridge = f"Eliminando il denominatore da {prev_s} ci si aspetta {expected_s}. "
     return bridge + (detail or "")
+
+
+def split_fraction_poly(expr, var):
+    """Separa expr in (parte con denominatori che dipendono da var, resto
+    polinomiale). Serve per i passaggi in cui la frazione viene lasciata
+    intatta e si lavora solo sui termini polinomiali (tipico: portare tutto
+    a primo membro): li' il confronto giusto e' fra le sole parti
+    polinomiali, mentre trattare la riga come 'un'unica frazione da
+    ricombinare' non spiega niente allo studente."""
+    terms = expr.args if expr.is_Add else (expr,)
+    frac = S(0)
+    poly = S(0)
+    for t in terms:
+        if var in side_denominator(t, var).free_symbols:
+            frac += t
+        else:
+            poly += t
+    return frac, poly
+
+
+def check_fraction_transport(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
+    """Passaggio fra due righe con frazioni in cui la PARTE FRAZIONARIA e'
+    rimasta identica (nessuna ricombinazione, nessuna moltiplicazione) e a
+    cambiare sono solo i termini polinomiali: allora l'errore, se c'e', sta
+    tutto li' e va diagnosticato confrontando le sole parti polinomiali.
+
+    Perche' e' matematicamente lecito concludere 'errore' qui: se le parti
+    frazionarie si annullano nella differenza e resta un polinomio P != 0,
+    allora cur_diff = prev_diff + P. Un passaggio valido richiederebbe
+    cur_diff = k*prev_diff; ma (k-1)*prev_diff = P con prev_diff che ha
+    davvero var al denominatore e P polinomiale forza k = 1 e quindi P = 0.
+    Quindi P != 0 implica passaggio sbagliato, senza rischio di falso
+    allarme. Ritorna None se il pattern non si applica."""
+    fp_l, pp_l = split_fraction_poly(prev_lhs, var)
+    fp_r, pp_r = split_fraction_poly(prev_rhs, var)
+    fc_l, pc_l = split_fraction_poly(cur_lhs, var)
+    fc_r, pc_r = split_fraction_poly(cur_rhs, var)
+
+    prev_frac_diff = cancel(fp_l - fp_r)
+    cur_frac_diff = cancel(fc_l - fc_r)
+    if prev_frac_diff == 0 or simplify(cancel(cur_frac_diff - prev_frac_diff)) != 0:
+        return None  # la parte frazionaria e' cambiata: non e' questo il caso
+
+    residuo = cancel((pc_l - pc_r) - (pp_l - pp_r))
+    if simplify(residuo) == 0:
+        return {'supported': True, 'equivalent': True, 'relation_kind': 'equivalence'}
+    if poly_coeffs(residuo, var) is None:
+        return None  # residuo non polinomiale/di grado troppo alto: non concludere
+    diag = diagnose_step(pp_l, pp_r, pc_l, pc_r, var)
+    if diag is None:
+        return None
+    return {'supported': True, 'equivalent': False, 'relation_kind': 'equivalence',
+            'combine_diagnosis': diag}
+
+
+def check_partial_denominator_clearing(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
+    """Errore classico nell'eliminare un denominatore: lo studente
+    moltiplica per il denominatore SOLO la frazione (che diventa il suo
+    numeratore) e lascia gli altri termini come stavano, invece di
+    moltiplicare tutto.
+
+    Riconosciuto confrontando la riga scritta con esattamente quel gesto
+    sbagliato (numeratore + resto invariato): se combacia, la causa è certa
+    e si può nominare. Vale anche quando il risultato CORRETTO sarebbe di
+    grado troppo alto per questo motore — ed è il caso che conta, perché lì
+    ogni altra strada si fermerebbe a 'troppo complesso' pur essendo un
+    errore semplicissimo da spiegare. None se non combacia."""
+    prev_diff = prev_lhs - prev_rhs
+    frac, poly = split_fraction_poly(prev_diff, var)
+    if frac == 0 or simplify(poly) == 0:
+        return None
+    numer, denom = together(frac).as_numer_denom()
+    if var not in denom.free_symbols:
+        return None
+    cur_diff = cancel(cur_lhs - cur_rhs)
+    if simplify(cancel(cur_diff - (numer + poly))) != 0:
+        return None
+    denom_s = format_expr_raw(denom)
+    poly_s = format_expr_raw(poly)
+    diag = (f"Per eliminare il denominatore hai moltiplicato per ({denom_s}) solo la frazione: "
+            f"va moltiplicato per ({denom_s}) OGNI termine dei due membri. "
+            f"{poly_s} è rimasto com'era, invece di diventare ({poly_s})({denom_s}).")
+    return {'supported': True, 'equivalent': False, 'relation_kind': 'implication',
+            'combine_diagnosis': diag}
 
 
 def _is_fraction_sum(side, var):
@@ -652,6 +873,32 @@ def compare_solutions(true_set, declared_values, declared_is_empty_claim=False):
     return {'status': 'ok', 'correct': true_vals}
 
 
+def looks_like_solution_row(text, var):
+    """True se questa riga sembra la DICHIARAZIONE DELLA RISPOSTA FINALE e
+    non un passaggio dell'esercizio. Usata solo per l'ultima riga scritta, e
+    solo quando quella riga non e' interpretabile come equazione singola:
+    tipicamente perche' contiene piu' di un '=' ('x = 0 & x = -1') o una
+    freccia di conclusione ('... => x = -2', '... => IMPOSSIBILE').
+
+    Senza questo controllo righe del genere venivano marcate 'unreadable'
+    con un '?' rosso e la nota "non sono riuscito a interpretare questa riga
+    come equazione": per lo studente sembra un errore suo, mentre la riga e'
+    perfettamente sensata — semplicemente non e' un passaggio. Il verdetto
+    su quella riga lo da' gia' il controllo finale.
+
+    Volutamente restrittivo: pretende che i valori dichiarati siano NUMERI.
+    Cosi' una riga che non c'entra (es. una disequazione, che questo motore
+    non sa ancora gestire) non viene silenziosamente nascosta come se fosse
+    una risposta finale, ma resta segnalata come non interpretata."""
+    if is_declared_empty(text):
+        return True
+    try:
+        values = parse_declared_solutions(text, var)
+    except Exception:
+        return False
+    return bool(values) and all(getattr(v, 'is_number', False) for v in values)
+
+
 # Ruoli che questa prima versione sa gestire per il confronto passo-passo.
 # Gli altri (domain, substitution, side_calc, case_split) sono riconosciuti
 # dal contratto ma non ancora implementati: lo diciamo onestamente invece
@@ -669,7 +916,14 @@ def process_sheet(rows, variable_hint=None):
     first_equation = None
     solution_row = None
 
-    for row in rows:
+    # Indice (nella lista rows) dell'ultima riga con del testo: e' l'unica
+    # che ha senso interpretare come dichiarazione della risposta finale.
+    last_written = None
+    for i, row in enumerate(rows):
+        if (row.get('plain') or '').strip():
+            last_written = i
+
+    for row_position, row in enumerate(rows):
         idx = row.get('index')
         plain = row.get('plain', '') or ''
         role = (row.get('role_hint') or 'equation').lower()
@@ -691,10 +945,36 @@ def process_sheet(rows, variable_hint=None):
             steps.append({'index': idx, 'status': 'skip'})
             continue
 
+        # Disequazione: riga scritta benissimo, semplicemente fuori da quello
+        # che questo motore sa ancora fare. Va detto con parole sue, non con
+        # un messaggio sul numero di '=' trovati, che sembrerebbe un errore
+        # dello studente quando non lo e'.
+        # Le frecce di conclusione ('=>', '⇒') vanno tolte PRIMA di cercare i
+        # segni di disuguaglianza: contengono un '>' e farebbero scambiare
+        # per disequazione una normale riga di risposta finale.
+        plain_senza_frecce = _ARROW_RE.sub(' ', plain)
+        if any(sign in plain_senza_frecce for sign in ('<', '>', '≤', '≥', '⩽', '⩾')):
+            steps.append({
+                'index': idx, 'status': 'unreadable', 'relation': None,
+                'note': "Questa è una disequazione: per ora il motore controlla solo le equazioni "
+                        "(le disequazioni richiedono di seguire anche il verso, che non è ancora gestito). "
+                        "La riga non viene controllata: non conta né come errore né come ok."
+            })
+            continue
+
         try:
             lhs, rhs = split_equation(plain)
             var = detect_variable(lhs, rhs, hint=variable_hint)
         except Exception as e:
+            # L'ultima riga scritta puo' benissimo non essere un'equazione:
+            # e' la risposta finale ("x = 0 & x = -1", "... => IMPOSSIBILE").
+            # In quel caso non e' un errore dello studente e non va marcata
+            # come illeggibile: la valuta il controllo finale.
+            hint_var = first_equation[2] if first_equation else Symbol(variable_hint or 'x')
+            if row_position == last_written and looks_like_solution_row(plain, hint_var):
+                solution_row = row
+                steps.append({'index': idx, 'status': 'skip', 'relation': 'solution'})
+                continue
             steps.append({'index': idx, 'status': 'unreadable',
                           'note': f"Non sono riuscito a interpretare questa riga come equazione: {e}"})
             continue
@@ -702,12 +982,20 @@ def process_sheet(rows, variable_hint=None):
         if first_equation is None:
             first_equation = (lhs, rhs, var)
 
+        # Versione non valutata della riga: serve solo alle diagnosi
+        # strutturali (vedi safe_parse_raw). Se il parsing grezzo fallisce si
+        # prosegue senza: e' un di piu' per spiegare meglio, non un requisito.
+        try:
+            raw_lhs, raw_rhs = split_equation(plain, raw=True)
+        except Exception:
+            raw_lhs, raw_rhs = None, None
+
         if prev_parsed is None:
             steps.append({'index': idx, 'status': 'first'})
-            prev_parsed = (lhs, rhs, var)
+            prev_parsed = (lhs, rhs, var, raw_lhs, raw_rhs)
             continue
 
-        p_lhs, p_rhs, _p_var = prev_parsed
+        p_lhs, p_rhs, _p_var, p_raw_lhs, p_raw_rhs = prev_parsed
         rel = check_relation(p_lhs, p_rhs, lhs, rhs, var)
         relation_label = 'equivalence' if rel['supported'] else None
 
@@ -716,7 +1004,7 @@ def process_sheet(rows, variable_hint=None):
             relation_label = rel.get('relation_kind')
 
         if not rel['supported']:
-            bad_factor_diag = _bad_factor_diagnosis(p_lhs, p_rhs, lhs, rhs, var)
+            bad_factor_diag = _bad_factor_diagnosis(p_lhs, p_rhs, lhs, rhs, var, raw_lhs, raw_rhs)
             if bad_factor_diag is not None:
                 steps.append({'index': idx, 'status': 'error', 'relation': None, 'diagnosis': bad_factor_diag})
             else:
@@ -730,20 +1018,29 @@ def process_sheet(rows, variable_hint=None):
             note = FRACTION_IMPLICATION_NOTE if relation_label == 'implication' else None
             steps.append({'index': idx, 'status': 'ok', 'relation': relation_label, 'note': note})
         else:
-            if 'combine_diagnosis' in rel:
+            # Ordine deliberato: dalla diagnosi piu' specifica (che nomina
+            # l'operazione che lo studente stava facendo) alla piu' generica.
+            # 1. Raccoglimento impossibile: la struttura scritta dice da sola
+            #    cosa stava provando a fare, ed e' sbagliato a monte.
+            diag = _bad_factor_diagnosis(p_lhs, p_rhs, lhs, rhs, var, raw_lhs, raw_rhs)
+            # 2. Diagnosi gia' prodotte dal classificatore delle frazioni.
+            if diag is None and 'combine_diagnosis' in rel:
                 diag = rel['combine_diagnosis']
-            elif relation_label == 'implication':
+            if diag is None and relation_label == 'implication' and 'expected_lhs' in rel:
                 diag = diagnose_fraction_step(p_lhs, p_rhs, rel['expected_lhs'], rel['expected_rhs'], lhs, rhs, var)
-            else:
-                diag = None
+            # 3. Moltiplicazione/divisione per una costante: confronto
+            #    moltiplicativo mirato invece di quello additivo generico.
+            if diag is None:
                 k = rel.get('k')
                 if k is not None and k != 1:
                     diag = diagnose_multiply_step(p_lhs, p_rhs, lhs, rhs, var, k)
-                if diag is None:
-                    diag = diagnose_step(p_lhs, p_rhs, lhs, rhs, var)
+            # 4. Confronto generico termine per termine.
+            if diag is None:
+                diag = diagnose_step(p_lhs, p_rhs, lhs, rhs, var,
+                                     p_raw_lhs, p_raw_rhs, raw_lhs, raw_rhs)
             steps.append({'index': idx, 'status': 'error', 'relation': relation_label, 'diagnosis': diag})
 
-        prev_parsed = (lhs, rhs, var)
+        prev_parsed = (lhs, rhs, var, raw_lhs, raw_rhs)
 
     # ---------- Controllo finale ----------
     if solution_row is None and rows:

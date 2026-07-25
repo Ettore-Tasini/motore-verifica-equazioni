@@ -1,4 +1,9 @@
 fastapi
 uvicorn[standard]
-sympy
+# Versione FISSATA di proposito: il motore di verifica dipende in modo fine
+# da come SymPy semplifica/canonicalizza le espressioni. Se qui la versione
+# fosse libera, Render potrebbe installarne una diversa da quella usata per
+# i test in locale, e i test non direbbero piu' nulla su cosa gira davvero
+# in produzione (e' gia' successo: locale 1.8 vs Render 1.14).
+sympy==1.14.0
 redis
