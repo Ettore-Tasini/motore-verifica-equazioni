@@ -208,6 +208,18 @@ def check_fraction_relation(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     if not row_has_fraction(prev_lhs, prev_rhs, var):
         return {'supported': False}
 
+    if row_has_fraction(cur_lhs, cur_rhs, var):
+        # La riga corrente ha ancora una frazione: non è un tentativo di
+        # eliminare il denominatore (quello produce un polinomio pulito),
+        # ma di raccogliere più frazioni dello stesso lato in una sola.
+        # Il confronto giusto è contro prev ricombinato (together), non
+        # contro prev moltiplicato per D.
+        expected_lhs, expected_rhs = together(prev_lhs), together(prev_rhs)
+        diag = diagnose_combine_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_lhs, cur_rhs, var)
+        if diag is None:
+            return {'supported': False}
+        return {'supported': True, 'equivalent': False, 'relation_kind': 'equivalence', 'combine_diagnosis': diag}
+
     D = common_denominator(prev_lhs, prev_rhs, var)
     expected_lhs, expected_rhs = clear_denominator(prev_lhs, prev_rhs, D)
 
@@ -345,6 +357,35 @@ def diagnose_fraction_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_l
     detail = diagnose_step(expected_lhs, expected_rhs, cur_lhs, cur_rhs, var)
     bridge = f"Eliminando il denominatore da {prev_s} ci si aspetta {expected_s}. "
     return bridge + (detail or "")
+
+
+def diagnose_combine_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_lhs, cur_rhs, var):
+    """Diagnosi per un errore nel raccogliere più frazioni in una sola sullo
+    STESSO lato (mcm sbagliato, numeratore calcolato male), senza che
+    l'equazione sia stata moltiplicata per nulla — quindi expected_lhs/rhs
+    sono semplicemente prev ricombinato (together), non una forma
+    polinomiale: il confronto è per cancellazione dell'intera frazione, non
+    coefficiente per coefficiente (diagnose_step non si applica, richiede
+    lati polinomiali). Usa format_expr_raw ovunque (mai format_expr, che
+    farebbe expand e romperebbe la frazione unica in una somma di frazioni,
+    non più fedele a quanto scritto)."""
+    mism_left = simplify(cancel(cur_lhs - expected_lhs)) != 0
+    mism_right = simplify(cancel(cur_rhs - expected_rhs)) != 0
+    if not mism_left and not mism_right:
+        return None
+
+    def side_msg(label, prev_s, expected_s, cur_s):
+        return (f"hai combinato le frazioni {label} in modo scorretto: partendo da {prev_s} "
+                f"ci si aspetta {expected_s}, tu hai scritto {cur_s}. Controlla il minimo comune "
+                f"denominatore: forse manca un fattore, o il numeratore non è stato calcolato bene")
+
+    parts = []
+    if mism_left:
+        parts.append(side_msg("a sinistra", format_expr_raw(prev_lhs), format_expr_raw(expected_lhs), format_expr_raw(cur_lhs)))
+    if mism_right:
+        parts.append(side_msg("a destra", format_expr_raw(prev_rhs), format_expr_raw(expected_rhs), format_expr_raw(cur_rhs)))
+    text = '; '.join(parts) + '.'
+    return text[0].upper() + text[1:]
 
 
 def solve_original(lhs, rhs, var):
@@ -504,7 +545,9 @@ def process_sheet(rows, variable_hint=None):
             note = FRACTION_IMPLICATION_NOTE if relation_label == 'implication' else None
             steps.append({'index': idx, 'status': 'ok', 'relation': relation_label, 'note': note})
         else:
-            if relation_label == 'implication':
+            if 'combine_diagnosis' in rel:
+                diag = rel['combine_diagnosis']
+            elif relation_label == 'implication':
                 diag = diagnose_fraction_step(p_lhs, p_rhs, rel['expected_lhs'], rel['expected_rhs'], lhs, rhs, var)
             else:
                 diag = diagnose_step(p_lhs, p_rhs, lhs, rhs, var)
