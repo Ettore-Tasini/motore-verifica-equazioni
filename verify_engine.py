@@ -348,6 +348,43 @@ def _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     return None
 
 
+def _distribution_mismatch_diagnosis(prev_side, cur_side, var, label):
+    """Riconosce una distribuzione incompleta: prev_side ha la forma F*(...)
+    esplicita e cur_side sembra un tentativo di distribuirla ma non
+    corrisponde all'espansione corretta — nomina esattamente il termine
+    dentro la parentesi che non è stato moltiplicato. None se prev_side non
+    aveva questa forma (allora la causa dell'errore è un'altra e non va
+    inventata qui). Si applica solo quando F contiene la variabile (es.
+    x*(x+3)): se F è un numero puro (es. 2*(x-3)), SymPy lo distribuisce già
+    automaticamente in fase di parsing (e' una sua canonicalizzazione, non
+    controllabile da qui) — a quel punto prev_side arriva già espanso e
+    questa funzione non trova nulla da segnalare, il che va bene: il
+    fallback generico del chiamante resta comunque corretto e non
+    fuorviante per quel caso."""
+    factors = Mul.make_args(prev_side)
+    add_factors = [f for f in factors if f.is_Add]
+    if len(add_factors) != 1:
+        return None
+    rest = [f for f in factors if f is not add_factors[0]]
+    F = Mul(*rest) if rest else S(1)
+    if F == 1:
+        return None
+    expected = expand(prev_side)
+    if simplify(cancel(cur_side - expected)) == 0:
+        return None
+    expected_coeffs = poly_coeffs(expected, var)
+    cur_coeffs = poly_coeffs(cur_side, var)
+    if expected_coeffs is None or cur_coeffs is None:
+        return None
+    diffs = [d for d in (0, 1, 2) if simplify(expected_coeffs[d] - cur_coeffs[d]) != 0]
+    if not diffs:
+        return None
+    d = max(diffs)
+    return (f"Hai distribuito {format_expr_raw(F)} solo su una parte della parentesi {label}: "
+            f"{format_expr_raw(prev_side)} diventa correttamente {format_expr(expected)}, "
+            f"ma manca la moltiplicazione nel {term_label(d, var)}.")
+
+
 def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     """Per-side (left vs right) coefficient comparison — same style as the
     JS diagnosis, but exact/symbolic instead of numeric-fitted."""
@@ -372,21 +409,33 @@ def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     # different message: compare the whole side before/after, not term by term.
     right_is_trivial = not side_has_content(pR, cR)
     left_is_trivial = not side_has_content(pL, cL)
+    # "L'altro lato non serve toccarlo" vale anche quando resta semplicemente
+    # invariato (non solo quando è sempre zero) — ma solo per un mismatch a
+    # un grado solo: con 2+ gradi coinvolti il confronto termine-per-termine
+    # qui sotto è già informativo di suo, non serve allargare la condizione.
+    right_unchanged_all = all(simplify(pR[d] - cR[d]) == 0 for d in (0, 1, 2))
+    left_unchanged_all = all(simplify(pL[d] - cL[d]) == 0 for d in (0, 1, 2))
     mism_all_on_left = all(simplify(pR[d] - cR[d]) == 0 for d in mism)
     mism_all_on_right = all(simplify(pL[d] - cL[d]) == 0 for d in mism)
 
-    if mism_all_on_left and right_is_trivial:
+    if mism_all_on_left and (right_is_trivial or (right_unchanged_all and len(mism) == 1)):
         bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
         if bad_factor is not None:
             return bad_factor
+        dist_msg = _distribution_mismatch_diagnosis(prev_lhs, cur_lhs, var, "sinistro")
+        if dist_msg is not None:
+            return dist_msg
         prev_s, cur_s = format_expr(prev_lhs), format_expr(cur_lhs)
         return (f"Hai riscritto il lato sinistro in modo scorretto: prima era {prev_s}, ora è {cur_s} — "
                 f"non sono la stessa espressione. Se hai provato a raccogliere un fattore comune, "
                 f"controlla che moltiplichi davvero TUTTI i termini dentro la parentesi, non solo alcuni.")
-    if mism_all_on_right and left_is_trivial:
+    if mism_all_on_right and (left_is_trivial or (left_unchanged_all and len(mism) == 1)):
         bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
         if bad_factor is not None:
             return bad_factor
+        dist_msg = _distribution_mismatch_diagnosis(prev_rhs, cur_rhs, var, "destro")
+        if dist_msg is not None:
+            return dist_msg
         prev_s, cur_s = format_expr(prev_rhs), format_expr(cur_rhs)
         return (f"Hai riscritto il lato destro in modo scorretto: prima era {prev_s}, ora è {cur_s} — "
                 f"non sono la stessa espressione. Se hai provato a raccogliere un fattore comune, "
@@ -427,6 +476,20 @@ def diagnose_fraction_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_l
     return bridge + (detail or "")
 
 
+def _is_fraction_sum(side, var):
+    """True se side è una somma di 2+ termini, almeno due dei quali hanno
+    individualmente un denominatore che dipende da var — cioè c'era
+    davvero più di una frazione da combinare. Se il lato è UNA sola
+    frazione (o una frazione sola più roba senza frazioni), 'combinare le
+    frazioni' non è l'operazione plausibile: l'errore è altrove (tipico
+    caso: un trasporto che lascia la frazione intatta e sbaglia il segno
+    di un altro termine) e va lasciato al fallback onesto invece di
+    inventare una spiegazione sul mcm che non c'entra."""
+    terms = side.args if side.is_Add else (side,)
+    frac_terms = [t for t in terms if var in side_denominator(t, var).free_symbols]
+    return len(frac_terms) >= 2
+
+
 def diagnose_combine_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_lhs, cur_rhs, var):
     """Diagnosi per un errore nel raccogliere più frazioni in una sola sullo
     STESSO lato (mcm sbagliato, numeratore calcolato male), senza che
@@ -439,6 +502,10 @@ def diagnose_combine_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_lh
     non più fedele a quanto scritto)."""
     mism_left = simplify(cancel(cur_lhs - expected_lhs)) != 0
     mism_right = simplify(cancel(cur_rhs - expected_rhs)) != 0
+    if mism_left and not _is_fraction_sum(prev_lhs, var):
+        mism_left = False
+    if mism_right and not _is_fraction_sum(prev_rhs, var):
+        mism_right = False
     if not mism_left and not mism_right:
         return None
 
@@ -470,12 +537,25 @@ def solve_original(lhs, rhs, var):
     return result
 
 
-_SPLIT_RE = re.compile(r'\bor\b|\bo\b|∨|;|,')
+_SPLIT_RE = re.compile(r'\bor\b|\bo\b|∨|;|,|&')
+_ARROW_RE = re.compile(r'=>|⇒|∴')
+
+
+def strip_reasoning_prefix(text):
+    """Se la riga contiene una freccia di implicazione (es. 'discriminante
+    negativo => impossibile', o '-2 ± sqrt(9-4) => x = -2'), tiene solo la
+    conclusione dopo l'ULTIMA freccia, scartando i conti/il ragionamento
+    prima — altrimenti quel testo aggiunge un altro '=' che rompe il parsing
+    (split_equation/parse_declared_solutions contano gli '=' per capire cosa
+    stanno leggendo) e la dichiarazione finale non viene capita per niente."""
+    parts = _ARROW_RE.split(text)
+    return parts[-1].strip() if len(parts) > 1 else text
 
 
 def parse_declared_solutions(text, var):
     """Parses a student's final-answer line into a list of SymPy values.
-    Accepts 'x=3', 'x=2 or x=3', 'x=2, x=3', etc."""
+    Accepts 'x=3', 'x=2 or x=3', 'x=2, x=3', 'x=2 & x=3', etc."""
+    text = strip_reasoning_prefix(text)
     parts = _SPLIT_RE.split(text)
     values = []
     for part in parts:
@@ -501,6 +581,7 @@ def is_declared_empty(text):
     """Riconosce risposte come 'impossibile', 'nessuna soluzione', 'S = ∅', ecc.
     come dichiarazione esplicita che l'equazione non ha soluzioni — da NON
     confondere con un testo che semplicemente non si riesce a interpretare."""
+    text = strip_reasoning_prefix(text)
     t = text.strip().lower().replace(' ', '').rstrip('.')
     return t in _EMPTY_PHRASES
 
@@ -646,7 +727,17 @@ def process_sheet(rows, variable_hint=None):
                     cmp = compare_solutions(true_set, [], declared_is_empty_claim=True)
                 else:
                     declared = parse_declared_solutions(plain_text, f_var)
-                    cmp = compare_solutions(true_set, declared)
+                    if not declared and plain_text.strip():
+                        # Testo presente ma non interpretato come nessun
+                        # valore: NON trattarlo come "nessuna soluzione
+                        # dichiarata", altrimenti confrontare vuoto-contro-
+                        # vuoto (quando anche l'equazione vera non ha
+                        # soluzioni) darebbe un falso "tutto corretto" anche
+                        # se lo studente ha scritto una risposta sbagliata
+                        # che non siamo riusciti a leggere.
+                        cmp = {'status': 'unknown'}
+                    else:
+                        cmp = compare_solutions(true_set, declared)
         except Exception:
             cmp = {'status': 'unknown'}
 
