@@ -385,6 +385,38 @@ def _distribution_mismatch_diagnosis(prev_side, cur_side, var, label):
             f"ma manca la moltiplicazione nel {term_label(d, var)}.")
 
 
+def diagnose_multiply_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var, k):
+    """Diagnosi per un passaggio che moltiplica/divide entrambi i membri per
+    una costante k (k già noto da check_relation, dal coefficiente di grado
+    più alto). Confronta OGNI termine di OGNI lato contro k*prev — un
+    confronto moltiplicativo, non additivo come fa diagnose_step — molto più
+    mirato per questo tipo di passaggio (es. dividere per -1 e sbagliare il
+    segno di un solo termine). None se non si trova un numero ridotto di
+    mismatch puntuali: se anche con questo confronto le cose non tornano in
+    troppi punti, non è plausibile che l'operazione fosse davvero "molt. per
+    k ovunque tranne qui", meglio lasciare il fallback esistente."""
+    pL = poly_coeffs(prev_lhs, var); pR = poly_coeffs(prev_rhs, var)
+    cL = poly_coeffs(cur_lhs, var); cR = poly_coeffs(cur_rhs, var)
+    if None in (pL, pR, cL, cR):
+        return None
+    mism = []
+    for side_label, p, c in (("sinistra", pL, cL), ("destra", pR, cR)):
+        if all(simplify(p[d] - c[d]) == 0 for d in (0, 1, 2)):
+            continue  # lato mai toccato: non ha senso pretendere che sia stato moltiplicato per k
+        for d in (0, 1, 2):
+            if simplify(c[d] - k * p[d]) != 0:
+                mism.append((side_label, d, p[d], c[d]))
+    if not mism or len(mism) > 2:
+        return None
+    parts = []
+    for side_label, d, pval, cval in mism:
+        expected_val = simplify(k * pval)
+        parts.append(f"nel {term_label(d, var)} a {side_label} moltiplicando per {fmt_num(k)} "
+                      f"ci si aspetta {fmt_term(expected_val, d, var)}, tu hai scritto {fmt_term(cval, d, var)}")
+    text = '; '.join(parts) + '.'
+    return text[0].upper() + text[1:]
+
+
 def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     """Per-side (left vs right) coefficient comparison — same style as the
     JS diagnosis, but exact/symbolic instead of numeric-fitted."""
@@ -703,7 +735,12 @@ def process_sheet(rows, variable_hint=None):
             elif relation_label == 'implication':
                 diag = diagnose_fraction_step(p_lhs, p_rhs, rel['expected_lhs'], rel['expected_rhs'], lhs, rhs, var)
             else:
-                diag = diagnose_step(p_lhs, p_rhs, lhs, rhs, var)
+                diag = None
+                k = rel.get('k')
+                if k is not None and k != 1:
+                    diag = diagnose_multiply_step(p_lhs, p_rhs, lhs, rhs, var, k)
+                if diag is None:
+                    diag = diagnose_step(p_lhs, p_rhs, lhs, rhs, var)
             steps.append({'index': idx, 'status': 'error', 'relation': relation_label, 'diagnosis': diag})
 
         prev_parsed = (lhs, rhs, var)
