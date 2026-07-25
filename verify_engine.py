@@ -15,6 +15,7 @@ from sympy import E as _E
 from sympy import (
     Eq,
     FiniteSet,
+    Mul,
     Poly,
     S,
     Symbol,
@@ -286,6 +287,67 @@ def format_expr_raw(expr):
     return _house_style(str(expr))
 
 
+def _pulled_factor(expr, var):
+    """Se expr ha la forma F*(...) — un unico fattore Add (la parentesi
+    raccolta) e il resto un monomio puro c*var**k, k>=1 — ritorna (F, k).
+    None se questa struttura non è individuabile (nessun raccoglimento
+    esplicito, o la parentesi contiene altri simboli). Lavora sull'espressione
+    COSÌ COM'È STATA SCRITTA, prima di qualunque expand(): expand
+    distribuirebbe subito F dentro la parentesi, cancellando l'unico indizio
+    che lo studente ha provato a raccogliere qualcosa."""
+    factors = Mul.make_args(expr)
+    add_factors = [f for f in factors if f.is_Add]
+    if len(add_factors) != 1:
+        return None
+    rest = [f for f in factors if f is not add_factors[0]]
+    F = Mul(*rest) if rest else S(1)
+    if F == 1 or F.free_symbols != {var}:
+        return None
+    try:
+        p = Poly(F, var)
+    except Exception:
+        return None
+    monoms = p.monoms()
+    if len(monoms) != 1 or monoms[0][0] < 1:
+        return None
+    return F, monoms[0][0]
+
+
+def _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
+    """Riconosce un raccoglimento impossibile: lo studente ha raccolto un
+    fattore var**k su un lato (es. x^2) ma quel lato, nel passaggio
+    precedente, aveva un termine di grado inferiore a k (es. 3x) — quel
+    termine non è un multiplo del fattore raccolto, quindi il raccoglimento
+    non è valido a prescindere da cosa scrive dentro la parentesi. None se il
+    pattern non si applica (nessun raccoglimento esplicito individuato, o il
+    grado raccolto è comunque valido — allora l'errore è altrove, tipicamente
+    un pezzo dimenticato dentro la parentesi)."""
+    for prev_side, cur_side, label in ((prev_lhs, cur_lhs, "a sinistra"), (prev_rhs, cur_rhs, "a destra")):
+        # Il raccoglimento potrebbe non coprire l'intero lato (es. resta un
+        # termine noto fuori dalla parentesi: "x^2*(x+3) - 4"): va cercato in
+        # ciascun addendo, non solo nel lato preso per intero.
+        terms = cur_side.args if cur_side.is_Add else (cur_side,)
+        for term in terms:
+            pulled = _pulled_factor(term, var)
+            if pulled is None:
+                continue
+            F, k = pulled
+            prev_coeffs = poly_coeffs(prev_side, var)
+            if prev_coeffs is None:
+                continue
+            offending = [d for d in range(k) if simplify(prev_coeffs[d]) != 0]
+            if not offending:
+                continue
+            d = max(offending)
+            term_str = fmt_term(prev_coeffs[d], d, var)
+            if term_str.startswith('+'):
+                term_str = term_str[1:]
+            factor_str = format_expr_raw(F)
+            return (f"Non puoi raccogliere {factor_str} {label}: il termine {term_str} "
+                    f"non è un multiplo di {factor_str}.")
+    return None
+
+
 def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     """Per-side (left vs right) coefficient comparison — same style as the
     JS diagnosis, but exact/symbolic instead of numeric-fitted."""
@@ -314,11 +376,17 @@ def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
     mism_all_on_right = all(simplify(pL[d] - cL[d]) == 0 for d in mism)
 
     if mism_all_on_left and right_is_trivial:
+        bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
+        if bad_factor is not None:
+            return bad_factor
         prev_s, cur_s = format_expr(prev_lhs), format_expr(cur_lhs)
         return (f"Hai riscritto il lato sinistro in modo scorretto: prima era {prev_s}, ora è {cur_s} — "
                 f"non sono la stessa espressione. Se hai provato a raccogliere un fattore comune, "
                 f"controlla che moltiplichi davvero TUTTI i termini dentro la parentesi, non solo alcuni.")
     if mism_all_on_right and left_is_trivial:
+        bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
+        if bad_factor is not None:
+            return bad_factor
         prev_s, cur_s = format_expr(prev_rhs), format_expr(cur_rhs)
         return (f"Hai riscritto il lato destro in modo scorretto: prima era {prev_s}, ora è {cur_s} — "
                 f"non sono la stessa espressione. Se hai provato a raccogliere un fattore comune, "
@@ -535,12 +603,16 @@ def process_sheet(rows, variable_hint=None):
             relation_label = rel.get('relation_kind')
 
         if not rel['supported']:
-            steps.append({
-                'index': idx, 'status': 'unreadable', 'relation': None,
-                'note': "Questo passaggio è troppo complesso per questa versione del motore "
-                        "(per ora gestisce solo equazioni di 1°/2° grado, anche con frazioni algebriche, "
-                        "in una sola variabile, senza parametri)."
-            })
+            bad_factor_diag = _bad_factor_diagnosis(p_lhs, p_rhs, lhs, rhs, var)
+            if bad_factor_diag is not None:
+                steps.append({'index': idx, 'status': 'error', 'relation': None, 'diagnosis': bad_factor_diag})
+            else:
+                steps.append({
+                    'index': idx, 'status': 'unreadable', 'relation': None,
+                    'note': "Questo passaggio è troppo complesso per questa versione del motore "
+                            "(per ora gestisce solo equazioni di 1°/2° grado, anche con frazioni algebriche, "
+                            "in una sola variabile, senza parametri)."
+                })
         elif rel['equivalent']:
             note = FRACTION_IMPLICATION_NOTE if relation_label == 'implication' else None
             steps.append({'index': idx, 'status': 'ok', 'relation': relation_label, 'note': note})
