@@ -776,11 +776,32 @@ def diagnose_combine_step(prev_lhs, prev_rhs, expected_lhs, expected_rhs, cur_lh
     return text[0].upper() + text[1:]
 
 
+def format_solution(value):
+    """Una soluzione come la scriverebbe uno studente: niente '**', niente
+    '*' impliciti. Senza questo il riepilogo finale mostra roba tipo
+    'x**2 + 1', che sul foglio di un ragazzo non ci sta."""
+    return _house_style(str(value))
+
+
 def solve_original(lhs, rhs, var):
     """Solves the ORIGINAL equation (first row) for the true solution set,
     used by the final check. Real solutions only, matching the scope of
     these grades (no complex roots expected/taught here)."""
     from sympy import solveset
+
+    # Fuori dal 1./2. grado non si risponde. Non e' pignoleria formale: su
+    # un'equazione di 3. grado SymPy sa dare una risposta esatta, ma e' roba
+    # tipo "25/(108*(sqrt(139749)/1944 + 2/9)**(1/3)) + 1/2 + ...", che per
+    # uno studente non e' un aiuto — e' rumore che sembra pure autorevole.
+    # Meglio dire "non lo so controllare" (il chiamante trasforma None in
+    # 'unknown'), coerentemente con lo scope dichiarato del motore.
+    try:
+        numer, _denom = cancel(lhs - rhs).as_numer_denom()
+        if poly_coeffs(numer, var) is None:
+            return None
+    except Exception:
+        return None
+
     result = solveset(Eq(lhs, rhs), var, domain=S.Reals)
     if result == S.EmptySet and simplify(cancel(lhs - rhs)) == 0:
         # equazione razionale che è in realtà un'identità (vera per ogni x
@@ -1078,7 +1099,7 @@ def process_sheet(rows, variable_hint=None):
         if cmp['status'] == 'ok':
             final = {'status': 'ok', 'message': 'Hai trovato tutte le soluzioni corrette.'}
         elif cmp['status'] == 'wrongly_claimed_impossible':
-            correct = [str(v) for v in cmp['correct']]
+            correct = [format_solution(v) for v in cmp['correct']]
             final = {
                 'status': 'incomplete',
                 'message': "In realtà l'equazione ha soluzione: hai detto che era impossibile, ma non lo è. "
@@ -1086,15 +1107,15 @@ def process_sheet(rows, variable_hint=None):
                 'correct_solutions': correct,
             }
         elif cmp['status'] == 'incomplete':
-            missing = [str(v) for v in cmp['missing']]
+            missing = [format_solution(v) for v in cmp['missing']]
             final = {
                 'status': 'incomplete',
                 'message': "Le soluzioni che hai scritto sono corrette, ma non sono tutte: "
                            f"ti manca {'la soluzione' if len(missing) == 1 else 'le soluzioni'} {', '.join(missing)}.",
-                'correct_solutions': [str(v) for v in cmp['correct']],
+                'correct_solutions': [format_solution(v) for v in cmp['correct']],
             }
         elif cmp['status'] == 'invalid_solution_present':
-            invalid = [str(v) for v in cmp['invalid']]
+            invalid = [format_solution(v) for v in cmp['invalid']]
             if not cmp['correct']:
                 final = {
                     'status': 'invalid_solution_present',
@@ -1108,8 +1129,8 @@ def process_sheet(rows, variable_hint=None):
                     'status': 'invalid_solution_present',
                     'message': f"{'La soluzione' if len(invalid) == 1 else 'Le soluzioni'} {', '.join(invalid)} "
                                f"non {'è valida' if len(invalid) == 1 else 'sono valide'} per l'equazione di partenza. "
-                               f"Le soluzioni corrette sono: {', '.join(str(v) for v in cmp['correct'])}.",
-                    'correct_solutions': [str(v) for v in cmp['correct']],
+                               f"Le soluzioni corrette sono: {', '.join(format_solution(v) for v in cmp['correct'])}.",
+                    'correct_solutions': [format_solution(v) for v in cmp['correct']],
                 }
         else:
             final = {

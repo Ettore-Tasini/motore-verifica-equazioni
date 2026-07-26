@@ -24,8 +24,24 @@ import sys
 
 import verify_engine as engine
 
-# (nome, righe, [(indice_riga, stato_atteso, [frammenti_richiesti], [frammenti_vietati])])
+# (nome, righe, [(riga, stato, [richiesti], [vietati])])
+# oppure con un 4o elemento: {"richiesti": [...], "vietati": [...]} riferito
+# al messaggio del RIEPILOGO finale (final_check).
 CASI = [
+    (
+        "esercizio di 3o grado: niente soluzioni illeggibili",
+        ["(x+3)/2 + 4/(3*x-4) = 3*x^2+1", "((x+3)*(3*x-4)+8)/(6*x-8) = 3*x^2+1"],
+        [],
+        # Fuori dallo scope dichiarato (1o/2o grado): deve ammetterlo, non
+        # sputare la radice cubica esatta che nessuno studente sa leggere.
+        {"richiesti": ["Non sono riuscito a determinare"], "vietati": ["**", "(1/3)"]},
+    ),
+    (
+        "riepilogo scritto come lo scriverebbe uno studente",
+        ["x^2 - 2 = 0", "x^2 = 2", "x = sqrt(2)"],
+        [],
+        {"vietati": ["**"]},
+    ),
     (
         "raccoglimento di x^2 quando un termine non lo contiene",
         ["2*x^2+1=3*x+4", "2*x^2-3*x=3", "x^2*(2-3)=3"],
@@ -114,7 +130,9 @@ def testo_riga(step):
 
 def main():
     falliti = []
-    for nome, righe, attese in CASI:
+    for caso in CASI:
+        nome, righe, attese = caso[0], caso[1], caso[2]
+        final_spec = caso[3] if len(caso) > 3 else None
         rows = [{"index": i, "plain": r} for i, r in enumerate(righe)]
         try:
             risultato = engine.process_sheet(rows)
@@ -143,6 +161,18 @@ def main():
                     falliti.append(
                         f"[{nome}] riga {idx}: il messaggio contiene '{frammento}', che qui è fuorviante\n"
                         f"    messaggio: {messaggio.strip()}")
+
+        if final_spec:
+            finale = risultato["final_check"]["message"]
+            finale += " " + " ".join(risultato["final_check"].get("correct_solutions") or [])
+            for frammento in final_spec.get("richiesti", []):
+                if frammento not in finale:
+                    falliti.append(f"[{nome}] riepilogo: manca '{frammento}'\n    riepilogo: {finale.strip()}")
+            for frammento in final_spec.get("vietati", []):
+                if frammento in finale:
+                    falliti.append(
+                        f"[{nome}] riepilogo: contiene '{frammento}', illeggibile per uno studente\n"
+                        f"    riepilogo: {finale.strip()}")
 
     if falliti:
         print(f"FALLITI: {len(falliti)}\n")
