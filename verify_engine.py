@@ -430,6 +430,31 @@ def _distribution_mismatch_diagnosis(prev_side, cur_side, var, label, raw_prev_s
     source = raw_prev_side if raw_prev_side is not None else prev_side
     parts = _factor_and_paren(source)
     if parts is None:
+        # La parentesi può essere solo UNO degli addendi del membro
+        # (es. "5 - (x - 3)"): va cercata anche lì dentro, altrimenti il caso
+        # più comune di tutti — il meno davanti alla parentesi — sfugge.
+        addendi = source.args if source.is_Add else ()
+        for addendo in addendi:
+            parts = _factor_and_paren(addendo)
+            if parts is None:
+                continue
+            F, paren = parts
+            resto = simplify(expand(prev_side) - expand(F * paren))
+            atteso_side = expand(resto + F * paren)
+            if simplify(cancel(expand(cur_side) - atteso_side)) == 0:
+                return None  # questo pezzo è stato svolto bene
+            if F.is_number and F < 0:
+                dentro = format_expr_raw(paren)
+                # '-1(x - 3)' non si scrive: davanti alla parentesi si scrive '-(x - 3)'
+                scritto = f"-({dentro})" if F == -1 else f"{format_expr_raw(F)}({dentro})"
+                cosa = "al segno meno" if F == -1 else f"al {format_expr_raw(F)}"
+                return (f"Attenzione {cosa} davanti alla parentesi nel membro {label}: "
+                        f"{scritto} fa {format_expr(expand(F * paren))}, perché cambia il segno "
+                        f"di TUTTI i termini dentro la parentesi, non solo del primo.")
+            return (f"Nel membro {label} hai moltiplicato {format_expr_raw(F)} solo per una "
+                    f"parte della parentesi: {format_expr_raw(F)}({format_expr_raw(paren)}) fa "
+                    f"{format_expr(expand(F * paren))}. Va moltiplicato per OGNI termine "
+                    f"dentro la parentesi.")
         return None
     F, paren = parts
     expected = expand(F * paren)
@@ -455,6 +480,53 @@ def _distribution_mismatch_diagnosis(prev_side, cur_side, var, label, raw_prev_s
             f"dentro la parentesi.")
 
 
+def diagnose_lost_factor(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
+    """Lo studente ha diviso ENTRAMBI i membri per un'espressione che
+    contiene l'incognita (tipico: da 'x^2 = 3x' passa a 'x = 3' dividendo
+    per x). Non è un errore di calcolo — i conti tornano — ma fa sparire le
+    soluzioni che annullano quel fattore, ed è uno dei modi più comuni di
+    perdere una soluzione senza accorgersene.
+
+    Merita un messaggio suo perché il confronto numerico qui non ha nulla da
+    dire di sensato: il coefficiente di grado massimo si azzera, quindi il
+    motore calcolava k = 0 e finiva per scrivere 'moltiplicando per 0',
+    che per uno studente non vuol dire niente.
+
+    Ritorna anche le soluzioni perse, così il messaggio le mostra invece di
+    lasciarle indovinare (decisione di prodotto: rivelare, non solo
+    segnalare)."""
+    from sympy import solveset
+
+    diff_p = cancel(prev_lhs - prev_rhs)
+    diff_c = cancel(cur_lhs - cur_rhs)
+    if diff_p == 0 or diff_c == 0:
+        return None
+    quoziente = cancel(diff_p / diff_c)
+    if var not in quoziente.free_symbols:
+        return None
+    _num, den = quoziente.as_numer_denom()
+    if var in den.free_symbols:
+        return None  # non è una divisione pulita per un fattore
+    try:
+        perse = solveset(Eq(quoziente, 0), var, domain=S.Reals)
+    except Exception:
+        return None
+    if not isinstance(perse, FiniteSet) or len(perse) == 0:
+        return None
+    valori = sorted(perse, key=lambda v: str(v))
+    # Solo le soluzioni che erano DAVVERO soluzioni della riga precedente.
+    valori = [v for v in valori if simplify(diff_p.subs(var, v)) == 0]
+    if not valori:
+        return None
+    elenco = ', '.join(f"{var} = {format_solution(v)}" for v in valori)
+    q_str = format_expr_raw(quoziente)
+    plurale = "la soluzione" if len(valori) == 1 else "le soluzioni"
+    return (f"Hai diviso entrambi i membri per {q_str}: si può fare solo se "
+            f"{q_str} non è zero, quindi così si perde {plurale} {elenco}. "
+            f"Per non perdere niente, porta tutto a primo membro e raccogli "
+            f"{q_str} invece di dividere.")
+
+
 def diagnose_multiply_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var, k):
     """Diagnosi per un passaggio che moltiplica/divide entrambi i membri per
     una costante k (k già noto da check_relation, dal coefficiente di grado
@@ -478,9 +550,17 @@ def diagnose_multiply_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var, k):
                 mism.append((side_label, d, p[d], c[d]))
     if not mism or len(mism) > 2:
         return None
-    # k = -1 e' il caso "ho cambiato tutti i segni": chiamarlo
-    # "moltiplicando per -1" e' corretto ma non e' come lo pensa lo studente.
-    operazione = "cambiando tutti i segni" if k == -1 else f"moltiplicando per {fmt_num(k)}"
+    # Il nome dell'operazione va detto come la pensa lo studente: chi divide
+    # per 2 non pensa "moltiplico per 1/2", e chi cambia i segni non pensa
+    # "moltiplico per -1".
+    if k == -1:
+        operazione = "cambiando tutti i segni"
+    elif k.is_Rational and k.p == 1 and k.q != 1:
+        operazione = f"dividendo per {k.q}"
+    elif k.is_Rational and k.p == -1 and k.q != 1:
+        operazione = f"dividendo per -{k.q}"
+    else:
+        operazione = f"moltiplicando per {fmt_num(k)}"
     parts = []
     for side_label, d, pval, cval in mism:
         expected_val = simplify(k * pval)
@@ -488,6 +568,103 @@ def diagnose_multiply_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var, k):
                       f"ci si aspetta {fmt_term(expected_val, d, var)}, tu hai scritto {fmt_term(cval, d, var)}")
     text = '; '.join(parts) + '.'
     return text[0].upper() + text[1:]
+
+
+def _unlike_terms_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var):
+    """Termini non simili sommati fra loro: '2x + 3' diventa '5x'. E' fra gli
+    errori piu' frequenti in assoluto e ha bisogno del suo nome — il
+    confronto per coefficienti parlerebbe di un fantomatico 'moltiplicando
+    per 5/2', che allo studente non dice niente e per giunta gli fa credere
+    di aver sbagliato un'operazione che non stava facendo."""
+    pL = poly_coeffs(prev_lhs, var); pR = poly_coeffs(prev_rhs, var)
+    cL = poly_coeffs(cur_lhs, var); cR = poly_coeffs(cur_rhs, var)
+    if None in (pL, pR, cL, cR):
+        return None
+    for p_side, c_side, altro_p, altro_c, side_label in (
+            (pL, cL, pR, cR, "sinistra"), (pR, cR, pL, cL, "destra")):
+        # l'altro membro dev'essere rimasto fermo: se e' cambiato anche quello,
+        # stava facendo qualcos'altro e questa spiegazione sarebbe inventata
+        if any(simplify(altro_p[d] - altro_c[d]) != 0 for d in (0, 1, 2)):
+            continue
+        for d_tenuto in (2, 1):
+            for d_perso in (1, 0):
+                if d_perso >= d_tenuto:
+                    continue
+                if simplify(p_side[d_perso]) == 0 or simplify(p_side[d_tenuto]) == 0:
+                    continue
+                fuso = simplify(c_side[d_tenuto] - (p_side[d_tenuto] + p_side[d_perso])) == 0
+                sparito = simplify(c_side[d_perso]) == 0
+                if fuso and sparito:
+                    t1 = fmt_term(p_side[d_tenuto], d_tenuto, var).lstrip('+')
+                    t2_segno = fmt_term(p_side[d_perso], d_perso, var)
+                    t2 = t2_segno.lstrip('+')
+                    somma = fmt_term(c_side[d_tenuto], d_tenuto, var).lstrip('+')
+                    # scritta come sul foglio: "2x + 3", non "2x +3"
+                    espressione = f"{t1} + {t2}" if t2_segno.startswith('+') else f"{t1} - {t2.lstrip('-')}"
+                    return (f"Nel membro di {side_label} hai sommato {t1} e {t2} come se fossero "
+                            f"termini simili: {espressione} non fa {somma}. Si possono sommare "
+                            f"solo i termini con la stessa parte letterale, quindi {t1} e {t2} "
+                            f"vanno lasciati separati.")
+    return None
+
+
+def _square_expansion_diagnosis(prev_side, cur_side, var, label, raw_prev_side=None):
+    """Quadrato di binomio sviluppato senza il doppio prodotto — l'errore
+    più classico di tutti: (x-3)^2 scritto come x^2 - 9. Serve la forma
+    grezza della riga precedente, perché SymPy tiene (x-3)**2 ma il
+    confronto per coefficienti da solo direbbe soltanto che "manca un
+    termine con x", senza mai nominare il doppio prodotto."""
+    source = raw_prev_side if raw_prev_side is not None else prev_side
+    termini = source.args if source.is_Add else (source,)
+    for termine in termini:
+        for pezzo in Mul.make_args(termine):
+            if not (pezzo.is_Pow and pezzo.exp == 2):
+                continue
+            base = pezzo.base.doit(deep=True)
+            if not base.is_Add or len(base.args) != 2:
+                continue
+            corretto = expand(base ** 2)
+            if simplify(cancel(expand(cur_side) - expand(prev_side))) == 0:
+                return None  # nessun errore da spiegare
+            coeff_corretti = poly_coeffs(corretto, var)
+            coeff_scritti = poly_coeffs(expand(cur_side), var)
+            if coeff_corretti is None or coeff_scritti is None:
+                return None
+            # Il doppio prodotto è sparito? È quella la firma di questo errore.
+            if simplify(coeff_corretti[1]) == 0 or simplify(coeff_scritti[1]) != 0:
+                return None
+            a, b = base.args
+            doppio = expand(2 * a * b)
+            # Si cita quello che lo studente ha scritto davvero (cur_side),
+            # non la forma teorica a^2+b^2 che non ha mai messo sul foglio.
+            return (f"Nel membro {label} hai sviluppato il quadrato dimenticando il doppio "
+                    f"prodotto: ({format_expr_raw(base)})^2 non fa {format_expr(cur_side)}, "
+                    f"fa {format_expr(corretto)}. Il quadrato di un binomio ha tre termini: "
+                    f"i due quadrati più il doppio prodotto {format_expr(doppio)}.")
+    return None
+
+
+def diagnose_square_expansion(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var,
+                              raw_prev_lhs=None, raw_prev_rhs=None):
+    """Cerca il quadrato di binomio sviluppato male su entrambi i membri, ma
+    solo se l'ALTRO membro e' rimasto fermo: se sono cambiati tutti e due lo
+    studente stava facendo anche altro e attribuire tutto al quadrato
+    sarebbe un'ipotesi, non una diagnosi."""
+    pL = poly_coeffs(prev_lhs, var); pR = poly_coeffs(prev_rhs, var)
+    cL = poly_coeffs(cur_lhs, var); cR = poly_coeffs(cur_rhs, var)
+    if None in (pL, pR, cL, cR):
+        return None
+    destro_fermo = all(simplify(pR[d] - cR[d]) == 0 for d in (0, 1, 2))
+    sinistro_fermo = all(simplify(pL[d] - cL[d]) == 0 for d in (0, 1, 2))
+    if destro_fermo:
+        msg = _square_expansion_diagnosis(prev_lhs, cur_lhs, var, "sinistro", raw_prev_lhs)
+        if msg is not None:
+            return msg
+    if sinistro_fermo:
+        msg = _square_expansion_diagnosis(prev_rhs, cur_rhs, var, "destro", raw_prev_rhs)
+        if msg is not None:
+            return msg
+    return None
 
 
 def _rewrite_message(label, prev_side, cur_side):
@@ -571,6 +748,9 @@ def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var,
         bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
         if bad_factor is not None:
             return bad_factor
+        sq_msg = _square_expansion_diagnosis(prev_lhs, cur_lhs, var, "sinistro", raw_prev_lhs)
+        if sq_msg is not None:
+            return sq_msg
         dist_msg = _distribution_mismatch_diagnosis(prev_lhs, cur_lhs, var, "sinistro", raw_prev_lhs)
         if dist_msg is not None:
             return dist_msg
@@ -582,6 +762,9 @@ def diagnose_step(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var,
         bad_factor = _bad_factor_diagnosis(prev_lhs, prev_rhs, cur_lhs, cur_rhs, var)
         if bad_factor is not None:
             return bad_factor
+        sq_msg = _square_expansion_diagnosis(prev_rhs, cur_rhs, var, "destro", raw_prev_rhs)
+        if sq_msg is not None:
+            return sq_msg
         dist_msg = _distribution_mismatch_diagnosis(prev_rhs, cur_rhs, var, "destro", raw_prev_rhs)
         if dist_msg is not None:
             return dist_msg
@@ -1041,9 +1224,20 @@ def process_sheet(rows, variable_hint=None):
         else:
             # Ordine deliberato: dalla diagnosi piu' specifica (che nomina
             # l'operazione che lo studente stava facendo) alla piu' generica.
+            # 0. Divisione per un'espressione con l'incognita: i conti tornano
+            #    ma sparisce una soluzione. Va prima di tutto perche' qui il
+            #    confronto numerico produce un k degenere e messaggi assurdi.
+            diag = diagnose_lost_factor(p_lhs, p_rhs, lhs, rhs, var)
             # 1. Raccoglimento impossibile: la struttura scritta dice da sola
             #    cosa stava provando a fare, ed e' sbagliato a monte.
-            diag = _bad_factor_diagnosis(p_lhs, p_rhs, lhs, rhs, var, raw_lhs, raw_rhs)
+            if diag is None:
+                diag = _bad_factor_diagnosis(p_lhs, p_rhs, lhs, rhs, var, raw_lhs, raw_rhs)
+            # 1-bis. Errori con un nome preciso, che il confronto numerico
+            #    generico descriverebbe come una moltiplicazione mai avvenuta.
+            if diag is None:
+                diag = _unlike_terms_diagnosis(p_lhs, p_rhs, lhs, rhs, var)
+            if diag is None:
+                diag = diagnose_square_expansion(p_lhs, p_rhs, lhs, rhs, var, p_raw_lhs, p_raw_rhs)
             # 2. Diagnosi gia' prodotte dal classificatore delle frazioni.
             if diag is None and 'combine_diagnosis' in rel:
                 diag = rel['combine_diagnosis']

@@ -100,7 +100,66 @@ CASI = [
         ["2*x^2+3*x<-4", "-2*x^2-3*x<4"],
         [(0, "unreadable", ["disequazione"], ["attesa esattamente una"])],
     ),
+    # --- errori classici, esercizi in test-library/scritti-da-claude/ ---
+    (
+        "divido per 2 solo alcuni termini",
+        ["2*x + 4 = 6", "x + 4 = 3", "x = -1"],
+        [(1, "error", ["dividendo per 2", "+2", "+4"], ["moltiplicando per 1/2"])],
+    ),
+    (
+        "quadrato di binomio senza doppio prodotto",
+        ["(x-3)^2 = 16", "x^2 - 9 = 16", "x^2 = 25"],
+        [(1, "error", ["doppio prodotto", "x^2 - 6x + 9", "x^2 - 9"],
+          ["entrambi i lati"])],
+    ),
+    (
+        "soluzione persa dividendo per l'incognita",
+        ["x^2 = 3*x", "x = 3"],
+        [(1, "error", ["diviso entrambi i membri per x", "si perde", "x = 0"],
+          ["moltiplicando per 0"])],
+        {"richiesti": ["ti manca la soluzione 0"]},
+    ),
+    (
+        "meno davanti alla parentesi",
+        ["5 - (x - 3) = 4", "5 - x - 3 = 4"],
+        [(1, "error", ["segno meno davanti alla parentesi", "-(x - 3)", "TUTTI i termini"],
+          ["-1(x - 3)"])],
+    ),
+    (
+        "somma di termini non simili",
+        ["2*x + 3 = 11", "5*x = 11"],
+        [(1, "error", ["termini simili", "2x + 3 non fa 5x"],
+          ["moltiplicando per 5/2", "2x +3"])],
+    ),
+    (
+        "trasporto cambiando segno a un termine solo",
+        ["3*x + 5 = 2*x - 1", "3*x - 2*x = -1 + 5"],
+        [(1, "error", ["senza cambiargli segno", "+5 deve diventare -5"], [])],
+    ),
+    (
+        "moltiplicazione in croce senza distribuire",
+        ["x/3 = (x+2)/4", "4*x = 3*x + 2"],
+        [(1, "error", ["+6", "+2"], ["troppo complesso"])],
+    ),
     # --- casi che devono restare OK: guardia contro i falsi allarmi ---
+    (
+        "primo grado svolto correttamente",
+        ["4*x - 7 = 2*x + 5", "4*x - 2*x = 5 + 7", "2*x = 12", "x = 6"],
+        [(1, "ok", [], []), (2, "ok", [], []), (3, "ok", [], [])],
+        {"richiesti": ["tutte le soluzioni corrette"]},
+    ),
+    (
+        "frazioni algebriche svolte correttamente",
+        ["1/(x-2) = 3/(x+1)", "x + 1 = 3*(x-2)", "x + 1 = 3*x - 6", "7 = 2*x", "x = 7/2"],
+        [(1, "ok", [], []), (2, "ok", [], []), (3, "ok", [], [])],
+        {"richiesti": ["tutte le soluzioni corrette"]},
+    ),
+    (
+        "impossibile riconosciuta correttamente",
+        ["x^2 + 4 = 0", "x^2 = -4", "impossibile"],
+        [(1, "ok", [], [])],
+        {"richiesti": ["tutte le soluzioni corrette"]},
+    ),
     (
         "raccoglimento corretto: nessun errore",
         ["x^2 + 3*x = 0", "x*(x+3) = 0"],
